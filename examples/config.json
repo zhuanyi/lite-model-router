@@ -1,0 +1,47 @@
+{
+  "listen": "127.0.0.1:4000",
+  "inbound_api_key_env": "",
+  "log_requests": true,
+  "backends": {
+    "gpu-laptop": {
+      "base_url": "http://gpu-laptop.local:8080",
+      "health": {"path": "/v1/models", "interval": "10s", "timeout": "2s"},
+      "first_byte_timeout": "120s",
+      "expose_models": ["qwen2.5-vl-32b"]
+    },
+    "mini-pc": {
+      "base_url": "http://mini-pc.local:11434",
+      "health": {"path": "/v1/models", "interval": "15s", "timeout": "2s"}
+    },
+    "openai": {
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY",
+      "auth_style": "bearer",
+      "health": {"path": ""}
+    },
+    "anthropic": {
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "auth_style": "anthropic",
+      "health": {"path": ""}
+    }
+  },
+  "models": {
+    "vision": [
+      {"backend": "gpu-laptop", "model": "qwen2.5-vl-32b"},
+      {"backend": "mini-pc", "model": "qwen2.5vl:7b"},
+      {"backend": "openai", "model": "gpt-4o-mini"}
+    ],
+    "coder": [
+      {"backend": "gpu-laptop", "model": "qwen3-coder-30b"},
+      {"backend": "mini-pc", "model": "qwen2.5-coder:7b"}
+    ],
+    "embed": [
+      {"backend": "mini-pc", "model": "nomic-embed-text"},
+      {"backend": "openai", "model": "text-embedding-3-small"}
+    ],
+    "claude": [
+      {"backend": "anthropic", "model": "claude-sonnet-4-5"}
+    ]
+  }
+}
