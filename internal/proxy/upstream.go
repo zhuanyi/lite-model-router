@@ -28,6 +28,7 @@ type backend struct {
 	key          string
 	probePath    string
 	probeTimeout time.Duration
+	streamIdle   time.Duration // 0 = no idle limit on committed responses
 	client       *http.Client
 	transport    *http.Transport
 	h            *health.Backend
@@ -50,7 +51,8 @@ func newBackend(name string, bc *config.Backend, useEnvProxy bool, h *health.Bac
 		name: name, base: strings.TrimRight(bc.BaseURL, "/"),
 		auth: bc.AuthStyle, key: bc.APIKey(),
 		probePath: bc.Health.Path, probeTimeout: bc.Health.TimeoutDur,
-		transport: tr, h: h,
+		streamIdle: bc.StreamIdle,
+		transport:  tr, h: h,
 		client: &http.Client{
 			Transport: tr,
 			// Never follow redirects: they could carry the API key elsewhere.

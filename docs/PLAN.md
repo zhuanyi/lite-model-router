@@ -150,7 +150,7 @@ Hand-rolled (no `httputil.ReverseProxy`, which adds `X-Forwarded-For` and has it
   - No model at all ⇒ 400 JSON error. Unknown model ⇒ 404 JSON error (OpenAI error shape).
 - **Request headers to upstream**: clone client headers, then delete: hop-by-hop (`Connection` + every header it names, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), client credentials (`Authorization`, `x-api-key`, `api-key`), `Content-Length` (set from buffer), `X-Model`. Then add backend auth (§4). `anthropic-*` and all other headers pass through. Also stripped: `Cookie`, `Forwarded`, `X-Forwarded-*`, `X-Real-Ip`, and any header name containing `_` (WSGI aliasing). `req.Host` = upstream host. `Accept-Encoding` is forwarded as-is and the transport has `DisableCompression: true`, so `Content-Encoding` and body bytes pass through untouched.
 - **Response**: copy status and headers minus hop-by-hop (incl. those named in the response `Connection` header and `Trailer`; trailers are dropped). `WriteHeader`, then flush immediately (SSE clients see the stream start), then copy loop with 32 KiB buffer and `Flush()` after every write via `http.ResponseController`.
-- **Upstream transport**: one `http.Transport` per backend shared by requests and probes: dial timeout = `connect_timeout`, `ResponseHeaderTimeout` = `first_byte_timeout`, `TLSHandshakeTimeout` = connect_timeout, `MaxIdleConnsPerHost` 16, `ForceAttemptHTTP2`, `Proxy` = `ProxyFromEnvironment` only if `use_env_proxy` (default **off**: LAN backends + cloud keys must not silently go through a proxy). Client `CheckRedirect` returns `http.ErrUseLastResponse` (never follow redirects; a redirect would carry the key elsewhere). No overall timeout. Note: `ResponseHeaderTimeout` does not cover a server that sends headers early then stalls; idle-read timeout is "maybe later".
+- **Upstream transport**: one `http.Transport` per backend shared by requests and probes: dial timeout = `connect_timeout`, `ResponseHeaderTimeout` = `first_byte_timeout`, `TLSHandshakeTimeout` = connect_timeout, `MaxIdleConnsPerHost` 16, `ForceAttemptHTTP2`, `Proxy` = `ProxyFromEnvironment` only if `use_env_proxy` (default **off**: LAN backends + cloud keys must not silently go through a proxy). Client `CheckRedirect` returns `http.ErrUseLastResponse` (never follow redirects; a redirect would carry the key elsewhere). No overall timeout. `ResponseHeaderTimeout` does not cover a server that sends headers early then stalls, so a per-backend `stream_idle_timeout` (default 300s, `"0"` disables) bounds the gap between body reads after commit; the timer runs only while waiting on upstream (not while writing to a slow client). On expiry the stream is aborted like any upstream read error and the backend is demoted.
 - **Server**: `ReadHeaderTimeout` 10s, `IdleTimeout` 120s, no `WriteTimeout` (streaming), `MaxHeaderBytes` 1 MiB. Plain-HTTP listener is HTTP/1.1. Go's server already rejects requests with both `Content-Length` and `Transfer-Encoding`. Shutdown on SIGINT/SIGTERM: `Shutdown` with a 10s drain, then `Close`.
 
 ## 8. Inbound auth
@@ -186,7 +186,7 @@ Never logs headers, bodies or keys. Health transitions are logged (`backend=gpu-
 
 ## 12. Maybe later (not in MVP)
 
-- Idle-read timeout between stream chunks; single-flight half-open trials.
+- Single-flight half-open trials.
 - Retry on 429 / honour `Retry-After`; per-backend concurrency limits.
 - Hot config reload (SIGHUP).
 - Anti-flap hysteresis (N consecutive successes before healthy).

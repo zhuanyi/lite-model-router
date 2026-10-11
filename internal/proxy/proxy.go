@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhuanyi/lite-model-router/internal/config"
@@ -342,7 +343,7 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 		rl.ttfb = time.Since(start)
 		t.be.h.Success()
 		rl.status = resp.StatusCode
-		h.stream(w, r, resp, rl) // may panic(http.ErrAbortHandler)
+		h.stream(w, r, resp, t.be, rl) // may panic(http.ErrAbortHandler)
 		return
 	}
 
@@ -414,8 +415,22 @@ func (h *Handler) send(r *http.Request, be *backend, body []byte) (*http.Respons
 
 // stream copies a committed upstream response to the client, flushing after
 // the headers and after every write so SSE events are not held back.
-func (h *Handler) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, rl *reqLog) {
+func (h *Handler) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, be *backend, rl *reqLog) {
 	defer resp.Body.Close()
+	// Idle-read watchdog: a backend that sent headers and then stalls would
+	// otherwise hold the client forever. The timer only runs while we wait on
+	// upstream (not while writing to a slow client); when it fires it closes
+	// the body, which unblocks the pending Read with an error.
+	var stalled atomic.Bool
+	var idle *time.Timer
+	if be.streamIdle > 0 {
+		idle = time.AfterFunc(be.streamIdle, func() {
+			stalled.Store(true)
+			resp.Body.Close()
+		})
+		idle.Stop()
+		defer idle.Stop()
+	}
 	hdr := resp.Header.Clone()
 	stripHopByHop(hdr) // also drops Trailer; trailers are not forwarded
 	dst := w.Header()
@@ -430,7 +445,13 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, resp *http.Resp
 	defer h.bufs.Put(bp)
 	buf := *bp
 	for {
+		if idle != nil {
+			idle.Reset(be.streamIdle)
+		}
 		n, rerr := resp.Body.Read(buf)
+		if idle != nil {
+			idle.Stop()
+		}
 		if n > 0 {
 			wn, werr := w.Write(buf[:n])
 			rl.bytes += int64(wn)
@@ -445,6 +466,10 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, resp *http.Resp
 			return
 		case r.Context().Err() != nil:
 			return // client cancelled; not an upstream fault
+		case stalled.Load():
+			rl.err = "upstream stream idle timeout"
+			be.h.Failure("stream idle timeout")
+			panic(http.ErrAbortHandler)
 		default:
 			// Upstream died after we committed. Abort the connection so the
 			// client sees a truncated stream, not a clean EOF that looks complete.
