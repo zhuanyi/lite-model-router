@@ -12,6 +12,12 @@ import (
 	"strings"
 )
 
+var (
+	errMalformed = errors.New("request body is not a valid JSON object")
+	errAmbiguous = errors.New(`request has more than one "model" field`)
+	errConflict  = errors.New(`X-Model conflicts with a "model" field in the request body`)
+)
+
 var errNoModel = errors.New(`no model specified: set "model" in the JSON body or multipart form, or send an X-Model header`)
 
 // rewriter returns a copy of the request body with the model replaced.
@@ -25,6 +31,7 @@ var sniffJSON = map[string]bool{"": true, "application/x-www-form-urlencoded": t
 // multipart), then the X-Model header. The returned rewriter is nil when the
 // model came from the header (the body is then forwarded untouched).
 func resolveModel(h http.Header, body []byte) (string, rewriter, error) {
+	header := strings.TrimSpace(h.Get("X-Model"))
 	mt, params, _ := mime.ParseMediaType(h.Get("Content-Type"))
 	trimmed := bytes.TrimSpace(body)
 	switch {
@@ -37,13 +44,16 @@ func resolveModel(h http.Header, body []byte) (string, rewriter, error) {
 		if err != nil {
 			return "", nil, err
 		}
+		if found && header != "" && strings.TrimSpace(string(body[start:end])) == "" {
+			return "", nil, errConflict
+		}
 		if name := strings.TrimSpace(string(body[start:end])); found && name != "" {
 			return name, func(m string) ([]byte, error) { return splice(body, start, end, m), nil }, nil
 		}
 	case len(trimmed) > 0 && (mt == "application/json" || strings.HasSuffix(mt, "+json") || (trimmed[0] == '{' && sniffJSON[mt])):
 		start, end, found, err := findJSONModel(body)
 		if err != nil {
-			return "", nil, errors.New("request body is not a valid JSON object")
+			return "", nil, err
 		}
 		if found {
 			var name string
@@ -58,10 +68,17 @@ func resolveModel(h http.Header, body []byte) (string, rewriter, error) {
 			}
 		}
 	}
-	if x := strings.TrimSpace(h.Get("X-Model")); x != "" {
-		return x, nil, nil
+	if header == "" {
+		return "", nil, errNoModel
 	}
-	return "", nil, errNoModel
+	// A body that carries its own (here: unusable) model field must not be
+	// silently overridden by the header; parsers may disagree about it.
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		if _, _, found, err := findJSONModel(body); found || err == errAmbiguous {
+			return "", nil, errConflict
+		}
+	}
+	return header, nil, nil
 }
 
 // findJSONModel locates the raw value of the top-level "model" key by
@@ -69,9 +86,10 @@ func resolveModel(h http.Header, body []byte) (string, rewriter, error) {
 // (see splice), so every other byte - base64 images, key order, whitespace -
 // is forwarded untouched and nothing is re-marshalled. It does not fully
 // validate the document; the backend will reject malformed JSON itself.
-// Like encoding/json, the last duplicate key wins.
+// Keys equal to "model" case-insensitively (as encoding/json matches) count;
+// more than one is rejected rather than guessed at.
 func findJSONModel(b []byte) (start, end int, found bool, err error) {
-	bad := errors.New("malformed JSON")
+	bad := errMalformed
 	i := skipSpace(b, 0)
 	if i >= len(b) || b[i] != '{' {
 		return 0, 0, false, bad
@@ -105,6 +123,9 @@ func findJSONModel(b []byte) (start, end int, found bool, err error) {
 			return 0, 0, false, bad
 		}
 		if isModelKey(key) {
+			if found {
+				return 0, 0, false, errAmbiguous // parsers disagree on duplicates: refuse
+			}
 			start, end, found = vs, ve, true
 		}
 		i = ve
@@ -114,10 +135,10 @@ func findJSONModel(b []byte) (start, end int, found bool, err error) {
 // isModelKey reports whether a quoted JSON key (quotes included) is "model".
 func isModelKey(quoted []byte) bool {
 	if bytes.IndexByte(quoted, '\\') < 0 {
-		return string(quoted) == `"model"`
+		return strings.EqualFold(string(quoted), `"model"`)
 	}
 	var k string
-	return json.Unmarshal(quoted, &k) == nil && k == "model"
+	return json.Unmarshal(quoted, &k) == nil && strings.EqualFold(k, "model")
 }
 
 func skipSpace(b []byte, i int) int {
@@ -210,11 +231,11 @@ func findMultipartModel(body []byte, boundary string) (start, end int, found boo
 	delim := []byte("--" + boundary)
 	next := []byte("\r\n--" + boundary)
 
-	pos := bytes.Index(body, delim)
+	pos := indexDelim(body, delim, true)
 	for pos >= 0 {
 		pos += len(delim)
 		if bytes.HasPrefix(body[pos:], []byte("--")) {
-			return 0, 0, false, nil // closing delimiter
+			return start, end, found, nil // closing delimiter
 		}
 		nl := bytes.IndexByte(body[pos:], '\n') // skip transport padding to end of line
 		if nl < 0 {
@@ -233,17 +254,41 @@ func findMultipartModel(body []byte, boundary string) (start, end int, found boo
 			}
 			hdr, valStart = body[pos:pos+i], pos+i+4
 		}
-		i := bytes.Index(body[valStart:], next)
+		i := indexDelim(body[valStart:], next, false)
 		if i < 0 {
 			return 0, 0, false, malformed
 		}
 		valEnd := valStart + i
 		if partName(hdr) == "model" {
-			return valStart, valEnd, true, nil
+			if found {
+				return 0, 0, false, errAmbiguous
+			}
+			start, end, found = valStart, valEnd, true
 		}
 		pos = valEnd + 2 // at the next delimiter
 	}
 	return 0, 0, false, malformed
+}
+
+// indexDelim finds delim followed by CRLF, "--", space or tab (RFC 2046), so a
+// longer boundary sharing our prefix, or payload bytes that merely look like
+// the delimiter, cannot split a part. atLineStart additionally requires it to
+// begin a line (or the buffer).
+func indexDelim(b, delim []byte, atLineStart bool) int {
+	for off := 0; ; {
+		i := bytes.Index(b[off:], delim)
+		if i < 0 {
+			return -1
+		}
+		i += off
+		rest := b[i+len(delim):]
+		ok := bytes.HasPrefix(rest, []byte("\r\n")) || bytes.HasPrefix(rest, []byte("--")) ||
+			(len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t'))
+		if ok && (!atLineStart || i == 0 || b[i-1] == '\n') {
+			return i
+		}
+		off = i + 1
+	}
 }
 
 // partName returns the form field name from a part's header block.

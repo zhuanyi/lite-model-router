@@ -139,3 +139,46 @@ func TestHTTPKeyWarning(t *testing.T) {
 		t.Fatal("warning leaks key")
 	}
 }
+
+func TestPrintingNeverLeaksKeys(t *testing.T) {
+	setEnv(t)
+	c, err := Parse([]byte(validJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]any{"cfg ptr": c, "cfg val": *c, "backend ptr": c.Backends["cloud"], "backend val": *c.Backends["cloud"]} {
+		for _, f := range []string{"%v", "%+v", "%#v", "%s"} {
+			if s := fmt.Sprintf(f, v); strings.Contains(s, "cloud-secret") || strings.Contains(s, "inbound-secret") {
+				t.Errorf("%s with %s leaks: %s", name, f, s)
+			}
+		}
+	}
+}
+
+func TestSecretEnvTrimmed(t *testing.T) {
+	t.Setenv("LMR_TEST_CLOUD", " key-with-newline\n")
+	c, err := Parse([]byte(`{"backends":{"a":{"base_url":"https://x","api_key_env":"LMR_TEST_CLOUD"}}}`))
+	if err != nil || c.Backends["a"].APIKey() != "key-with-newline" {
+		t.Fatalf("err=%v key=%q", err, c.Backends["a"].APIKey())
+	}
+	t.Setenv("LMR_TEST_CLOUD", " \n")
+	if _, err := Parse([]byte(`{"backends":{"a":{"base_url":"https://x","api_key_env":"LMR_TEST_CLOUD"}}}`)); err == nil {
+		t.Fatal("whitespace-only secret must count as missing")
+	}
+}
+
+func TestListenWarningOnlyForFinalAddress(t *testing.T) {
+	// File binds publicly (allowed), override goes back to loopback: no warning.
+	c, err := Parse([]byte(`{"listen":"0.0.0.0:4000","allow_unauthenticated_remote":true,"backends":{"a":{"base_url":"http://127.0.0.1:1"}}}`))
+	if err != nil || len(c.Warnings) != 1 {
+		t.Fatalf("err=%v warnings=%v", err, c.Warnings)
+	}
+	if err := c.SetListen("127.0.0.1:9"); err != nil || len(c.Warnings) != 0 {
+		t.Fatalf("err=%v warnings=%v", err, c.Warnings)
+	}
+	// And the reverse: loopback file, public override -> exactly one warning.
+	c, _ = Parse([]byte(`{"allow_unauthenticated_remote":true,"backends":{"a":{"base_url":"http://127.0.0.1:1"}}}`))
+	if err := c.SetListen("0.0.0.0:9"); err != nil || len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "0.0.0.0:9") {
+		t.Fatalf("err=%v warnings=%v", err, c.Warnings)
+	}
+}

@@ -58,7 +58,7 @@ Flags: `-config path` (default `config.json`), `-listen addr` (overrides config)
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | `127.0.0.1:4000` | Bind address. Non-loopback requires `inbound_api_key_env` (or `allow_unauthenticated_remote: true`). |
-| `inbound_api_key_env` | – | Env var holding the key clients must send (`Authorization: Bearer` or `x-api-key`). `/healthz` is always open. |
+| `inbound_api_key_env` | – | Env var holding the key clients must send (`Authorization: Bearer` or `x-api-key`). `/healthz` is always open. Without it, only requests with a loopback `Host` (and loopback `Origin`, if any) are accepted, to block browser CSRF / DNS rebinding. |
 | `max_body_bytes` | 64 MiB | Request bodies are buffered (for retry); larger ⇒ 413. |
 | `max_concurrent_requests` | 64 | In-flight proxied requests (bounds memory). |
 | `log_requests` | `true` | One log line per request. |
