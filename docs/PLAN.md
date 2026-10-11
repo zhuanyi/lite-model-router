@@ -105,12 +105,13 @@ HEALTHY ── failure (probe fail, connect err,  ──► UNHEALTHY(failures=n
            first-byte timeout, 5xx) 
 ```
 
-- Start state: **healthy** (optimistic) — so a restart doesn't black-hole traffic for one interval; the first failure demotes it.
+- Start state: **healthy** (optimistic). Actively probed backends are probed once, concurrently, before the server starts serving (bounded by `health.timeout`), so a backend that is down at startup is demoted before the first request. Chosen over an extra "unknown" state: it needs no third state in the routing rule, and the cost is at most one probe timeout at startup. Passive-only backends cannot be checked up front and stay optimistic.
+- On the healthy transition, the `/status` fields `last_error` and `consecutive_failures` are cleared. The internal backoff level is kept (anti-flap, below).
 - `backoff(n) = min(interval * 2^(n-1), 5m)` (interval defaults 10s; for passive-only backends uses 10s base).
 - Active prober: every `interval` (while healthy) or at `retryAt` (while unhealthy), `GET base_url+health.path` with the backend's auth, timeout `health.timeout`. Only 2xx counts as up for probes (a 401 means misconfigured key — mark unhealthy with lastErr "probe status 401" so `/status` surfaces it).
 - Anti-flap (decided): `failures` is **not** reset by a single success. On success the backend becomes healthy and `healthySince=now`; on the next failure, if it had been healthy for ≥ `2*interval`, `failures` restarts from 0, otherwise it keeps growing. So a flapping backend's backoff keeps growing, a stable one starts fresh. Probe interval and backoff get ±10% jitter.
 - A probe failure is ignored (not counted) if a proxied request to that backend succeeded within the last `interval` (a saturated llama.cpp may time out `/v1/models` while serving fine).
-- Passive marking: connect/TLS error, first-byte timeout, and status 502/503/504 ⇒ failure. Other 5xx (e.g. 500 from a malformed request) ⇒ try next backend but **do not demote** (a bad request must not mark the whole chain unhealthy). Any response < 500 ⇒ success.
+- Passive marking: connect/TLS error, first-byte timeout, and status 502/503/504 ⇒ failure. Other 5xx ⇒ try next backend but **do not demote**: a 500 may come from a malformed request (which must not mark the whole chain unhealthy), and a 501 means this backend does not implement the endpoint while still serving its other routes. Any response < 500 ⇒ success.
 - Passive-only backends (no probe): when `retryAt` passes, the backend becomes eligible again ("half-open"): the next real request is tried on it. Known limitation: concurrent requests may all trial a half-open backend; each failed trial falls over to the next candidate transparently, so the cost is latency, not errors.
 - Probes are GET only, use the backend's auth and transport, drain ≤ 64 KiB of the body, and stop on shutdown.
 ### Candidate ordering
@@ -167,7 +168,7 @@ One line per proxied request, `log/slog` text handler to stderr:
 `level=INFO msg=req method=POST path=/v1/chat/completions model=vision backend=mini-pc upstream_model=qwen2.5-vl-7b status=200 attempts=2 ttfb_ms=812 dur_ms=10233 bytes=48123 failed_attempts="gpu-laptop: connection refused"`
 
 `failed_attempts` (present only when an attempt failed) lists every failed attempt as `backend: error class`, matching the 502 error body.
-Never logs headers, bodies or keys. Health transitions are logged (`backend=gpu-laptop healthy=false err="dial tcp: connection refused"`). `-quiet` / `"log_requests": false` disables per-request lines.
+Requests rejected before proxying (401 inbound auth, 403 non-loopback host/origin, 404 unknown path) get the same line with the status and a short `err` reason. `/healthz`, `/status` and `/v1/models` are answered locally and not logged. Never logs headers, bodies or keys. Health transitions are logged (`backend=gpu-laptop healthy=false err="dial tcp: connection refused"`). `-quiet` / `"log_requests": false` disables per-request lines.
 
 ## 10. Success criteria (verifiable)
 

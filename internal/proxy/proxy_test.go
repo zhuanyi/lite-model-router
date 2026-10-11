@@ -1029,3 +1029,83 @@ func TestNextProbeInOmittedForPassiveBackend(t *testing.T) {
 		t.Fatalf("passive-only backend reports next_probe_in: %s", body)
 	}
 }
+
+func TestInitialProbeBeforeServing(t *testing.T) {
+	// A is down and actively probed (default path, long interval). Start must
+	// probe it before serving, so the very first request goes straight to B.
+	b := newFake(t, "B", nil)
+	e := newEnv(t, map[string]any{
+		"A": map[string]any{"base_url": deadURL(t), "health": map[string]any{"interval": "1h"}},
+		"B": bk(b.URL),
+	}, map[string]any{"m": chain("A", "m", "B", "m")}, nil)
+	if st := e.status(t)["A"]; st.Healthy || st.LastError != "connection refused" {
+		t.Fatalf("A not demoted by the initial probe: %+v", st)
+	}
+	resp, _ := e.chat(t, "m")
+	if resp.StatusCode != 200 || resp.Header.Get("X-Backend") != "B" {
+		t.Fatalf("status %d via %q", resp.StatusCode, resp.Header.Get("X-Backend"))
+	}
+	waitFor(t, "request log", func() bool { return strings.Contains(e.logs.String(), "msg=req") })
+	if logs := e.logs.String(); !strings.Contains(logs, "attempts=1") || strings.Contains(logs, "failed_attempts") {
+		t.Fatalf("first request paid a failed attempt:\n%s", logs)
+	}
+}
+
+func TestRejectedRequestsAreLogged(t *testing.T) {
+	t.Setenv("LMR_T_INBOUND", "inbound-key")
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")},
+		map[string]any{"inbound_api_key_env": "LMR_T_INBOUND"})
+
+	if resp, _ := e.chat(t, "m", "Authorization", "Bearer wrong-key-value"); resp.StatusCode != 401 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if resp, _ := e.do(t, "GET", "/nope", "", "Authorization", "Bearer inbound-key"); resp.StatusCode != 404 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	waitFor(t, "404 log", func() bool { return strings.Contains(e.logs.String(), "status=404") })
+	logs := e.logs.String()
+	if !strings.Contains(logs, `path=/v1/chat/completions`) || !strings.Contains(logs, `status=401`) ||
+		!strings.Contains(logs, `err="inbound auth failed"`) {
+		t.Errorf("401 not logged:\n%s", logs)
+	}
+	if !strings.Contains(logs, `path=/nope`) || !strings.Contains(logs, `err="unknown path"`) {
+		t.Errorf("404 not logged:\n%s", logs)
+	}
+	for _, secret := range []string{"wrong-key-value", "inbound-key"} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("log contains key material %q:\n%s", secret, logs)
+		}
+	}
+}
+
+func TestRejectedHostIsLoggedWithoutAuth(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")}, nil)
+	if resp, _ := e.chat(t, "m", "Origin", "https://evil.example"); resp.StatusCode != 403 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	waitFor(t, "403 log", func() bool { return strings.Contains(e.logs.String(), "status=403") })
+	if logs := e.logs.String(); !strings.Contains(logs, `err="non-loopback host or origin"`) {
+		t.Errorf("403 not logged:\n%s", logs)
+	}
+}
+
+func TestNotImplementedFallsBackWithoutDemoting(t *testing.T) {
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"embeddings not supported"}`, http.StatusNotImplemented)
+	})
+	b := newFake(t, "B", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL), "B": bk(b.URL)},
+		map[string]any{"m": chain("A", "m", "B", "m")}, nil)
+	resp, _ := e.do(t, "POST", "/v1/embeddings", `{"model":"m","input":"hi"}`, "Content-Type", "application/json")
+	if resp.StatusCode != 200 || resp.Header.Get("X-Backend") != "B" {
+		t.Fatalf("status %d via %q", resp.StatusCode, resp.Header.Get("X-Backend"))
+	}
+	if st := e.status(t)["A"]; !st.Healthy || st.ConsecutiveFailures != 0 {
+		t.Fatalf("501 demoted A: %+v", st)
+	}
+	if a.hits.Load() != 1 {
+		t.Fatalf("A hits = %d", a.hits.Load())
+	}
+}
