@@ -38,7 +38,8 @@ type Backend struct {
 
 	mu           sync.Mutex
 	healthy      bool
-	failures     int
+	failures     int       // backoff level; survives recovery for anti-flap (see down)
+	streak       int       // failures counted since the last healthy transition (/status)
 	retryAt      time.Time // when an unhealthy backend becomes eligible again
 	healthySince time.Time
 	lastChange   time.Time
@@ -111,6 +112,15 @@ func (b *Backend) ProbeOK() {
 	b.up(b.now())
 }
 
+// ProbeResult records the outcome of one probe: nil is up, an error is down.
+func (b *Backend) ProbeResult(err error) {
+	if err != nil {
+		b.ProbeFail(err.Error())
+	} else {
+		b.ProbeOK()
+	}
+}
+
 // ProbeFail records a failed probe. While healthy it is ignored if a proxied
 // request succeeded within the last interval (a saturated server may fail
 // probes while serving fine). Once unhealthy it always counts, otherwise
@@ -125,12 +135,14 @@ func (b *Backend) ProbeFail(msg string) {
 	b.down(msg, t)
 }
 
-// up marks the backend healthy. failures is deliberately not reset (anti-flap).
+// up marks the backend healthy and clears the /status error fields. failures
+// (the backoff level) is deliberately not reset (anti-flap).
 func (b *Backend) up(t time.Time) {
 	if b.healthy {
 		return
 	}
 	b.healthy, b.healthySince, b.lastChange = true, t, t
+	b.lastErr, b.streak = "", 0
 	b.log.Info("backend health", "backend", b.name, "healthy", true)
 	b.signal()
 }
@@ -154,6 +166,7 @@ func (b *Backend) down(msg string, t time.Time) {
 			b.failures = 0
 		}
 		b.failures++
+		b.streak++
 		b.healthy, b.lastChange = false, t
 		b.log.Warn("backend health", "backend", b.name, "healthy", false, "err", msg)
 	case t.Before(b.retryAt):
@@ -162,6 +175,7 @@ func (b *Backend) down(msg string, t time.Time) {
 		return
 	default:
 		b.failures++
+		b.streak++
 	}
 	b.retryAt = t.Add(time.Duration(float64(b.Backoff(b.failures)) * b.jitter()))
 	b.signal()
@@ -180,7 +194,7 @@ type Snapshot struct {
 func (b *Backend) Snapshot() Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := Snapshot{Healthy: b.healthy, LastError: b.lastErr, LastChange: b.lastChange, ConsecutiveFailures: b.failures}
+	s := Snapshot{Healthy: b.healthy, LastError: b.lastErr, LastChange: b.lastChange, ConsecutiveFailures: b.streak}
 	if b.probing {
 		s.NextProbeIn = max(b.nextProbe.Sub(b.now()), 0).Round(time.Millisecond).String()
 	}
@@ -208,11 +222,7 @@ func (b *Backend) Run(ctx context.Context, probe func(context.Context) error) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
-			b.ProbeFail(err.Error())
-		} else {
-			b.ProbeOK()
-		}
+		b.ProbeResult(err)
 	}
 }
 
