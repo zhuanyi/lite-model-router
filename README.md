@@ -110,7 +110,7 @@ curl -s localhost:4000/status
 
 Flags: `-config path` (default `config.json`), `-listen addr` (overrides config), `-quiet` (no per-request log lines), `-version`.
 
-## ⚙️ Configuration
+## 🔧 Configuration
 
 <details open>
 <summary><b>Example config</b></summary>
@@ -184,7 +184,7 @@ qwen
 
 For a separate vision model setting, use the same base URL and the virtual model name `vision`. When the laptop is off, requests silently fall through to the mini PC (and then the cloud) without touching the client config. Anthropic-style clients can use `/v1/messages` the same way, as long as every backend in that chain speaks the Anthropic API (no translation is done).
 
-## 🖥️ Running as a service
+## 💻 Running as a service
 
 See [examples/lite-model-router.service](examples/lite-model-router.service): install the binary to `/usr/local/bin`, the config to `/etc/lite-model-router/config.json`, and secrets as `KEY=value` lines in `/etc/lite-model-router/env` (mode 600).
 
