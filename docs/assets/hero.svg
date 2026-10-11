@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">lite-model-router</title>
+  <desc id="desc">One model name, an ordered, health-checked fallback chain of real backends.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e3a5f"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <!-- Self-contained card: its own background keeps contrast on GitHub light and dark themes. -->
+  <rect width="1200" height="320" rx="24" fill="url(#bg)"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="64" y="140" font-size="64" font-weight="700" fill="#f8fafc">lite-model-router</text>
+    <text x="66" y="192" font-size="26" fill="#cbd5e1">One model name. An ordered, health-checked</text>
+    <text x="66" y="226" font-size="26" fill="#cbd5e1">fallback chain of real backends.</text>
+    <text x="66" y="272" font-size="18" fill="#7dd3fc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">single Go binary · stdlib only · OpenAI + Anthropic APIs</text>
+  </g>
+
+  <!-- Fallback chain motif: one virtual model, backends tried in chain order. -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" text-anchor="middle">
+    <rect x="800" y="56" width="168" height="44" rx="10" fill="#0ea5e9"/>
+    <text x="884" y="84" fill="#0f172a" font-weight="700">model: vision</text>
+
+    <path d="M884 100 V128 H1060 V146" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M884 100 V196 H1060 V214" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+
+    <rect x="960" y="148" width="200" height="40" rx="10" fill="#14532d" stroke="#4ade80" stroke-width="2"/>
+    <text x="1060" y="174" fill="#dcfce7">1 · gpu-laptop</text>
+    <rect x="960" y="216" width="200" height="40" rx="10" fill="#1e293b" stroke="#64748b" stroke-width="2"/>
+    <text x="1060" y="242" fill="#cbd5e1">2 · mini-pc</text>
+
+    <circle cx="1144" cy="168" r="5" fill="#4ade80"/>
+    <circle cx="1144" cy="236" r="5" fill="#64748b"/>
+  </g>
+</svg>
