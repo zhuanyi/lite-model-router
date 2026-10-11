@@ -1,0 +1,23 @@
+[Unit]
+Description=lite-model-router (LLM fallback proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/lite-model-router -config /etc/lite-model-router/config.json
+# Secrets live here, e.g. OPENAI_API_KEY=... and LMR_API_KEY=... (chmod 600)
+EnvironmentFile=-/etc/lite-model-router/env
+DynamicUser=yes
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
