@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +43,9 @@ type Handler struct {
 	log      *slog.Logger
 	logReqs  bool
 	maxBody  int64
+	allowRem bool          // allow_unauthenticated_remote: skip Host/Origin checks
+	bodyTime time.Duration // deadline for reading a request body
+	semWait  time.Duration // max wait for a concurrency slot
 	sem      chan struct{}
 	keyHash  [sha256.Size]byte
 	authOn   bool
@@ -58,7 +64,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Handler, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	h := &Handler{
-		log: logger, logReqs: cfg.LogRequests, maxBody: cfg.MaxBodyBytes,
+		log: logger, logReqs: cfg.LogRequests, maxBody: cfg.MaxBodyBytes, allowRem: cfg.AllowUnauthenticatedRemote,
+		bodyTime: 60 * time.Second, semWait: 30 * time.Second,
 		sem: make(chan struct{}, cfg.MaxConcurrentRequests), created: time.Now().Unix(),
 		backends: map[string]*backend{}, routes: map[string][]target{},
 		virtual: cfg.Models, owner: map[string]string{},
@@ -116,6 +123,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
+	if !h.authOn && !h.allowRem && !localRequest(r) {
+		// No inbound auth: refuse browsers (CSRF) and DNS-rebinding hosts.
+		writeError(w, http.StatusForbidden, "forbidden", "requests must target a loopback host when inbound auth is off")
+		return
+	}
 	if !h.authorized(r) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
@@ -131,6 +143,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "not found")
 	}
+}
+
+// localRequest reports whether the Host (and Origin, if sent) are loopback.
+func localRequest(r *http.Request) bool {
+	if !config.IsLoopbackHost(hostOnly(r.Host)) {
+		return false
+	}
+	if o := r.Header.Get("Origin"); o != "" {
+		u, err := url.Parse(o)
+		return err == nil && config.IsLoopbackHost(u.Hostname())
+	}
+	return true
+}
+
+// hostOnly strips an optional port and IPv6 brackets.
+func hostOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return strings.Trim(hostport, "[]")
 }
 
 // authorized checks Bearer or x-api-key against the inbound key. Both sides
@@ -213,26 +245,33 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, typ, msg)
 	}
 
-	for _, seg := range strings.Split(r.URL.Path, "/") {
-		if seg == ".." {
-			fail(http.StatusBadRequest, "invalid_request_error", "invalid path")
-			return
-		}
+	if !cleanPath(r) {
+		fail(http.StatusBadRequest, "invalid_request_error", "invalid path")
+		return
 	}
 
-	// Bound in-flight requests (and so buffered memory) before reading the body.
+	// Bound in-flight requests (and so buffered memory) before reading the
+	// body, but not for ever: a full house must not queue clients unboundedly.
+	wait := time.NewTimer(h.semWait)
+	defer wait.Stop()
 	select {
 	case h.sem <- struct{}{}:
 		defer func() { <-h.sem }()
 	case <-r.Context().Done():
 		rl.status = 499
 		return
+	case <-wait.C:
+		w.Header().Set("Retry-After", "1")
+		fail(http.StatusServiceUnavailable, "lmr_overloaded", "too many concurrent requests")
+		return
 	}
 
 	body, err := h.readBody(w, r)
 	if err != nil {
 		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			fail(http.StatusRequestTimeout, "invalid_request_error", "timed out reading request body")
+		} else if errors.As(err, &mbe) {
 			fail(http.StatusRequestEntityTooLarge, "invalid_request_error",
 				fmt.Sprintf("request body exceeds %d bytes", h.maxBody))
 		} else {
@@ -280,7 +319,11 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 				rl.status = 499
 				return
 			}
-			msg := t.be.safeErr(err)
+			if errors.Is(err, errBuild) { // our bug or a hostile request, not the backend's fault
+				fail(http.StatusInternalServerError, "lmr_internal_error", "could not build upstream request")
+				return
+			}
+			msg := describeError(err)
 			t.be.h.Failure(msg)
 			failed = append(failed, t.be.name+": "+msg)
 			continue
@@ -316,17 +359,42 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, erro
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
+	// A slow client must not pin a concurrency slot (and memory) for ever.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(h.bodyTime))
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+
 	rd := http.MaxBytesReader(w, r.Body, h.maxBody)
-	if cl := r.ContentLength; cl >= 0 {
-		if cl > h.maxBody {
-			return nil, &http.MaxBytesError{Limit: h.maxBody}
-		}
-		buf := make([]byte, cl) // exact size: avoids ReadAll's grow-and-copy on big bodies
-		_, err := io.ReadFull(rd, buf)
-		return buf, err
+	cl := r.ContentLength
+	if cl > h.maxBody {
+		return nil, &http.MaxBytesError{Limit: h.maxBody}
 	}
-	return io.ReadAll(rd)
+	// Never trust Content-Length for allocation: start small, grow as bytes arrive.
+	var buf bytes.Buffer
+	buf.Grow(int(min(max(cl, 0), 1<<20)))
+	_, err := buf.ReadFrom(rd)
+	return buf.Bytes(), err
 }
+
+// cleanPath rejects traversal and anything but plain printable ASCII, checking
+// both the raw and the percent-decoded path.
+func cleanPath(r *http.Request) bool {
+	for _, p := range []string{r.URL.Path, r.URL.EscapedPath()} {
+		for i := 0; i < len(p); i++ {
+			if c := p[i]; c < 0x20 || c >= 0x7f || c == '\\' {
+				return false
+			}
+		}
+	}
+	for _, seg := range strings.Split(r.URL.Path, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+var errBuild = errors.New("build upstream request")
 
 // send performs one upstream attempt.
 func (h *Handler) send(r *http.Request, be *backend, body []byte) (*http.Response, error) {
@@ -337,7 +405,7 @@ func (h *Handler) send(r *http.Request, be *backend, body []byte) (*http.Respons
 	// bytes.Reader gives NewRequest the exact ContentLength and a GetBody.
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, u, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errBuild, err)
 	}
 	req.Header = upstreamHeaders(r.Header)
 	be.applyAuth(req.Header)
@@ -396,9 +464,13 @@ type savedResponse struct {
 
 func saveResponse(resp *http.Response) *savedResponse {
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxDrain))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxDrain+1))
 	hdr := resp.Header.Clone()
 	stripHopByHop(hdr)
+	if len(body) > maxDrain {
+		body = body[:maxDrain]
+		hdr.Del("Content-Encoding") // a truncated gzip/br stream would be undecodable garbage
+	}
 	return &savedResponse{status: resp.StatusCode, header: hdr, body: body}
 }
 

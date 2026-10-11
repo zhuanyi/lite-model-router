@@ -24,7 +24,6 @@ const defaultAnthropicVersion = "2023-06-01"
 type backend struct {
 	name         string
 	base         string // base_url without trailing slash; never logged or served
-	host         string // base_url host, scrubbed from error text
 	auth         string
 	key          string
 	probePath    string
@@ -35,10 +34,6 @@ type backend struct {
 }
 
 func newBackend(name string, bc *config.Backend, useEnvProxy bool, h *health.Backend) (*backend, error) {
-	u, err := url.Parse(bc.BaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("backend %s: %w", name, err)
-	}
 	tr := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: bc.Connect, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   bc.Connect,
@@ -52,7 +47,7 @@ func newBackend(name string, bc *config.Backend, useEnvProxy bool, h *health.Bac
 		tr.Proxy = http.ProxyFromEnvironment
 	}
 	return &backend{
-		name: name, base: strings.TrimRight(bc.BaseURL, "/"), host: u.Host,
+		name: name, base: strings.TrimRight(bc.BaseURL, "/"),
 		auth: bc.AuthStyle, key: bc.APIKey(),
 		probePath: bc.Health.Path, probeTimeout: bc.Health.TimeoutDur,
 		transport: tr, h: h,
@@ -92,7 +87,7 @@ func (b *backend) probe(ctx context.Context) error {
 	b.applyAuth(req.Header)
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return errors.New(b.safeErr(err))
+		return errors.New(describeError(err))
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
@@ -102,30 +97,20 @@ func (b *backend) probe(ctx context.Context) error {
 	return nil
 }
 
-// safeErr renders an error for logs and /status without URLs or addresses.
-func (b *backend) safeErr(err error) string {
-	s := describeError(err)
-	if b.host != "" {
-		s = strings.ReplaceAll(s, b.host, "<host>")
-	}
-	return s
-}
-
-// describeError reduces a transport error to a short class. *url.Error is
-// stripped to its inner error because it embeds the full request URL.
+// describeError reduces a transport error to a fixed class string. Raw net
+// error text is never returned: it can carry addresses, URLs or hostnames.
 func describeError(err error) string {
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		err = ue.Err
-	}
 	var (
 		dns  *net.DNSError
-		op   *net.OpError
 		cert *tls.CertificateVerificationError
 		unk  x509.UnknownAuthorityError
 		ne   net.Error
 	)
-	msg := err.Error()
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	msg := err.Error() // inspected, never returned
 	switch {
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "connection refused"
@@ -136,15 +121,13 @@ func describeError(err error) string {
 	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()):
 		return "timeout"
 	case errors.As(err, &dns):
-		return "dns lookup failed"
+		return "dns error"
 	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-		return "connection closed before response"
+		return "connection closed"
 	case errors.As(err, &cert) || errors.As(err, &unk) || strings.HasPrefix(msg, "tls:") || strings.HasPrefix(msg, "x509:"):
 		return "tls error"
-	case errors.As(err, &op) && op.Err != nil:
-		return op.Op + ": " + op.Err.Error()
 	}
-	return msg
+	return "transport error"
 }
 
 // Header scrubbing (PLAN §7).
@@ -173,8 +156,16 @@ func upstreamHeaders(in http.Header) http.Header {
 	h := in.Clone()
 	stripHopByHop(h)
 	// Client credentials are proxy credentials, never backend credentials.
-	for _, k := range []string{"Authorization", "X-Api-Key", "Api-Key", "Content-Length", "X-Model"} {
+	for _, k := range []string{"Authorization", "X-Api-Key", "Api-Key", "Content-Length", "X-Model",
+		"Cookie", "Forwarded", "X-Real-Ip"} {
 		h.Del(k)
+	}
+	// Client-chain identity and underscore-named headers (which some servers
+	// conflate with their dashed twins) are not for the backend.
+	for k := range h {
+		if strings.HasPrefix(k, "X-Forwarded-") || strings.Contains(k, "_") {
+			delete(h, k)
+		}
 	}
 	if _, ok := h["User-Agent"]; !ok {
 		h["User-Agent"] = []string{""} // don't advertise Go-http-client

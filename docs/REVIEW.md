@@ -57,3 +57,17 @@ Checked with no finding:
 - Inbound auth is constant-time and covers `/status` and `/v1/models`.
 - The bind-address check covers `:4000`, `0.0.0.0`, `[::]`, hostnames and `-listen`.
 - Logs contain no headers, bodies or keys.
+
+Note on B3: with `allow_unauthenticated_remote: true`, the operator has explicitly exposed an unauthenticated listener to the LAN, so the Host and Origin checks are skipped. Otherwise every request from the LAN would get a 403.
+
+## 4. Verification after the fix round
+
+- `gofmt -l .` produces no output, `go vet ./...` is clean, `go test -race -count=1 ./...` passes, and `go.mod` has no `require` lines.
+- Benchmark on the 4-core CI-class container, with the proxy and the fake backend in the same process:
+
+  | Benchmark | Time per op | Memory per op | Allocs per op |
+  |---|---|---|---|
+  | `BenchmarkDirect` | ~150 µs | 8.6 KB | 93 |
+  | `BenchmarkViaProxy` | ~355 µs | 18.0 KB | 201 |
+
+  The proxy adds about 0.2 ms and about 9 KB per small chat request. That is negligible next to model inference.

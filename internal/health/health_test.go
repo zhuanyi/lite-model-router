@@ -143,6 +143,17 @@ func TestProbeFailureIgnoredAfterRecentProxySuccess(t *testing.T) {
 	}
 }
 
+func TestProbeFailCountsOnceUnhealthy(t *testing.T) {
+	b, c := newTest(10 * time.Second)
+	b.Success()
+	b.Failure("x") // demoted although a proxied success just happened
+	c.Advance(10 * time.Second)
+	b.ProbeFail("probe status 503") // fires at retryAt: must advance retryAt
+	if got := retryIn(b, c); got != 20*time.Second {
+		t.Fatalf("retryAt not advanced: %v", got)
+	}
+}
+
 func TestOrder(t *testing.T) {
 	type cand struct {
 		n  string
@@ -225,4 +236,20 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestRunWakesOnPassiveStateChange(t *testing.T) {
+	b := New("b", Options{Interval: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	go b.Run(ctx, func(context.Context) error { calls.Add(1); return nil })
+	waitFor(t, func() bool { return b.Snapshot().NextProbeIn != "" })
+	// Passive failure: retryAt = now+1h, but the prober must have re-armed its
+	// timer for the new schedule rather than sleep on the stale one.
+	b.mu.Lock()
+	b.interval = 30 * time.Millisecond // so backoff(1) is short
+	b.mu.Unlock()
+	b.Failure("boom")
+	waitFor(t, func() bool { return calls.Load() > 0 && b.Snapshot().Healthy })
 }

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -29,6 +30,8 @@ const (
 	DefaultConnectTimeout   = 3 * time.Second
 	DefaultFirstByteTimeout = 300 * time.Second
 )
+
+const listenWarnPrefix = "listening on"
 
 // Auth styles a backend can use.
 const (
@@ -89,10 +92,10 @@ type Health struct {
 }
 
 // String and GoString keep resolved secrets out of fmt output (%v, %+v, %#v).
-func (b *Backend) String() string   { return "backend(" + b.BaseURL + ")" }
-func (b *Backend) GoString() string { return b.String() }
-func (c *Config) String() string    { return "config(listen=" + c.Listen + ")" }
-func (c *Config) GoString() string  { return c.String() }
+func (b Backend) String() string   { return "backend(" + b.BaseURL + ")" }
+func (b Backend) GoString() string { return b.String() }
+func (c Config) String() string    { return "config(listen=" + c.Listen + ")" }
+func (c Config) GoString() string  { return c.String() }
 
 // APIKey returns the backend credential resolved from the environment.
 func (b *Backend) APIKey() string { return b.apiKey }
@@ -135,6 +138,8 @@ func Parse(data []byte) (*Config, error) {
 // bind-safety rule against the new address.
 func (c *Config) SetListen(addr string) error {
 	c.Listen = addr
+	// Drop the warning computed for the file's address; the final one wins.
+	c.Warnings = slices.DeleteFunc(c.Warnings, func(w string) bool { return strings.HasPrefix(w, listenWarnPrefix) })
 	if msg := c.checkListen(); msg != "" {
 		return errors.New("config: " + msg)
 	}
@@ -146,12 +151,12 @@ func (c *Config) checkListen() string {
 	if err != nil {
 		return fmt.Sprintf("listen %q: %v", c.Listen, err)
 	}
-	if !isLoopbackHost(host) && c.inboundKey == "" {
+	if !IsLoopbackHost(host) && c.inboundKey == "" {
 		if !c.AllowUnauthenticatedRemote {
 			return fmt.Sprintf("listen %q is not a loopback address and inbound_api_key_env is not set; "+
 				"set inbound_api_key_env or allow_unauthenticated_remote=true", c.Listen)
 		}
-		c.Warnings = append(c.Warnings, fmt.Sprintf("listening on %q without inbound authentication", c.Listen))
+		c.Warnings = append(c.Warnings, fmt.Sprintf(listenWarnPrefix+" %q without inbound authentication", c.Listen))
 	}
 	return ""
 }
@@ -167,7 +172,7 @@ func (c *Config) validate() error {
 		c.MaxConcurrentRequests = DefaultMaxConcurrent
 	}
 	if c.InboundAPIKeyEnv != "" {
-		if c.inboundKey = os.Getenv(c.InboundAPIKeyEnv); c.inboundKey == "" {
+		if c.inboundKey = secretEnv(c.InboundAPIKeyEnv); c.inboundKey == "" {
 			bad("inbound_api_key_env: environment variable %q is not set or empty", c.InboundAPIKeyEnv)
 		}
 	}
@@ -245,11 +250,11 @@ func (c *Config) validateBackend(name string, b *Backend, bad func(string, ...an
 	}
 
 	if b.APIKeyEnv != "" {
-		if b.apiKey = os.Getenv(b.APIKeyEnv); b.apiKey == "" {
+		if b.apiKey = secretEnv(b.APIKeyEnv); b.apiKey == "" {
 			bad("%s.api_key_env: environment variable %q is not set or empty", where, b.APIKeyEnv)
 		}
 	}
-	if b.apiKey != "" && u != nil && u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+	if b.apiKey != "" && u != nil && u.Scheme == "http" && !IsLoopbackHost(u.Hostname()) {
 		c.Warnings = append(c.Warnings, fmt.Sprintf(
 			"backend %q sends its API key over plain http to a non-loopback host", name))
 	}
@@ -276,8 +281,12 @@ func parseDur(where, s string, def time.Duration, bad func(string, ...any)) time
 	return d
 }
 
-// isLoopbackHost reports whether host is localhost or a loopback IP literal.
-func isLoopbackHost(host string) bool {
+// secretEnv reads a secret from the environment, trimming whitespace (a
+// trailing newline from `echo > file` is a classic); empty means missing.
+func secretEnv(name string) string { return strings.TrimSpace(os.Getenv(name)) }
+
+// IsLoopbackHost reports whether host is localhost or a loopback IP literal.
+func IsLoopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
