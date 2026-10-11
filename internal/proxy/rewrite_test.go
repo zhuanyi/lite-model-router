@@ -46,7 +46,9 @@ func TestFindJSONModel(t *testing.T) {
 		{"model inside string", `{"t":"\"model\":\"x\"","model":"a"}`, `"a"`},
 		{"escaped quote then backslash", `{"t":"a\\","model":"a"}`, `"a"`},
 		{"escaped key", `{"mod\u0065l":"a"}`, `"a"`},
-		{"last duplicate wins", `{"model":"a","model":"b"}`, `"b"`},
+		{"duplicate rejected", `{"model":"a","model":"b"}`, `ERR`},
+		{"case-variant duplicate rejected", `{"model":"a","Model":"b"}`, `ERR`},
+		{"single case variant", `{"MODEL":"a"}`, `"a"`},
 		{"non-string value", `{"model": 12 }`, `12`},
 		{"null", `{"model":null}`, `null`},
 		{"empty object", `{}`, ``},
@@ -109,6 +111,48 @@ func TestJSONResolveVariants(t *testing.T) {
 				t.Fatalf("got %q err %v", got, err)
 			}
 		})
+	}
+}
+
+func TestModelConfusionRejected(t *testing.T) {
+	mp2, mpCT := buildMultipartTwo(t)
+	cases := []struct {
+		name string
+		hdr  http.Header
+		body string
+	}{
+		{"json dup", jsonHeader(), `{"model":"a","model":"b"}`},
+		{"json case dup", jsonHeader(), `{"model":"a","Model":"b"}`},
+		{"x-model plus empty body model", http.Header{"Content-Type": {"application/json"}, "X-Model": {"h"}}, `{"model":""}`},
+		{"x-model plus body model other type", http.Header{"Content-Type": {"application/octet-stream"}, "X-Model": {"h"}}, `{"Model":"a"}`},
+		{"multipart dup", http.Header{"Content-Type": {mpCT}}, string(mp2)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := resolveModel(tc.hdr, []byte(tc.body)); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}
+
+func buildMultipartTwo(t *testing.T) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("model", "a")
+	_ = mw.WriteField("model", "b")
+	_ = mw.Close()
+	return buf.Bytes(), mw.FormDataContentType()
+}
+
+func TestMultipartBoundaryPrefixLookalike(t *testing.T) {
+	// "--xyz" followed by other bytes inside a value must not end the part.
+	body := "--xyz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nfoo\r\n--xyzZZ not a delimiter\r\n--xyz\r\n" +
+		"Content-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--xyz--\r\n"
+	s, e, found, err := findMultipartModel([]byte(body), "xyz")
+	if err != nil || !found || body[s:e] != "m" {
+		t.Fatalf("got %q found=%v err=%v", body[s:e], found, err)
 	}
 }
 

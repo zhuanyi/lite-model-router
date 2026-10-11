@@ -7,13 +7,19 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -568,6 +574,11 @@ func TestClientErrors(t *testing.T) {
 		{"encoded dot-dot", "POST", "/v1/%2e%2e/status", `{"model":"m"}`, 400},
 		{"not under v1", "POST", "/other", `{"model":"m"}`, 404},
 		{"bare v1", "GET", "/v1", ``, 404},
+		{"encoded backslash", "POST", "/v1/a%5Cb", `{"model":"m"}`, 400},
+		{"encoded NUL", "POST", "/v1/a%00b", `{"model":"m"}`, 400},
+		{"encoded newline", "POST", "/v1/a%0Ab", `{"model":"m"}`, 400},
+		{"encoded non-ascii", "POST", "/v1/caf%C3%A9", `{"model":"m"}`, 400},
+		{"duplicate model key", "POST", "/v1/chat/completions", `{"model":"m","Model":"x"}`, 400},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -702,6 +713,8 @@ func TestDescribeErrorStripsURL(t *testing.T) {
 
 // --- helpers ----------------------------------------------------------------
 
+func mustURL(p string) *url.URL { u, _ := url.Parse(p); return u }
+
 func modelOf(t *testing.T, body []byte) string {
 	t.Helper()
 	var d struct{ Model string }
@@ -709,4 +722,209 @@ func modelOf(t *testing.T, body []byte) string {
 		t.Fatal(fmt.Errorf("bad body %q: %w", body, err))
 	}
 	return d.Model
+}
+
+// --- fix round ---------------------------------------------------------------
+
+// rawRequest writes head+partial body on a fresh connection and returns the
+// response, leaving the body incomplete (a slow-loris client).
+func rawRequest(t *testing.T, e *env, head string) *http.Response {
+	t.Helper()
+	conn, err := net.Dial("tcp", e.srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	_, _ = io.WriteString(conn, head)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestSlowBodyTimesOutWithoutPreallocating(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")}, nil)
+	e.h.bodyTime = 150 * time.Millisecond
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	// Claims 50 MiB (under max_body_bytes) but sends 1 byte and stalls.
+	resp := rawRequest(t, e, "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 52428800\r\n\r\n{")
+	runtime.ReadMemStats(&after)
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > 16<<20 {
+		t.Fatalf("allocated %d MiB for a stalled upload: Content-Length was trusted", grown>>20)
+	}
+	waitFor(t, "semaphore slot released", func() bool { return len(e.h.sem) == 0 })
+	if resp, _ := e.chat(t, "m"); resp.StatusCode != 200 {
+		t.Fatalf("server unusable after timeout: %d", resp.StatusCode)
+	}
+}
+
+func TestSemaphoreWaitIsBounded(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")},
+		map[string]any{"max_concurrent_requests": 1})
+	e.h.semWait = 100 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() { defer close(done); e.chat(t, "m") }()
+	<-started
+	resp, body := e.chat(t, "m")
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "lmr_overloaded") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	close(release)
+	<-done
+}
+
+func TestTruncated5xxDropsContentEncoding(t *testing.T) {
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		w.WriteHeader(500)
+		_, _ = w.Write(bytes.Repeat([]byte{'x'}, maxDrain+500))
+	})
+	small := newFake(t, "S", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte("tiny"))
+	})
+	e := newEnv(t, map[string]any{"A": bk(a.URL), "S": bk(small.URL)},
+		map[string]any{"big": chain("A", "m"), "small": chain("S", "m")}, nil)
+
+	resp, body := e.chat(t, "big")
+	if resp.StatusCode != 500 || len(body) != maxDrain || resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("truncated: status=%d len=%d CE=%q", resp.StatusCode, len(body), resp.Header.Get("Content-Encoding"))
+	}
+	// Untruncated bodies keep their encoding.
+	if resp, _ := e.chat(t, "small"); resp.Header.Get("Content-Encoding") != "br" {
+		t.Fatal("complete 5xx body lost its Content-Encoding")
+	}
+}
+
+func TestRequestBuildErrorIs500AndDoesNotDemote(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")}, nil)
+	// A method that NewRequest rejects; the HTTP server would never deliver one,
+	// so drive the handler directly.
+	req := &http.Request{Method: "BAD METHOD", URL: mustURL("/v1/chat/completions"), Host: "127.0.0.1",
+		Header: http.Header{"X-Model": {"m"}}, Body: http.NoBody}
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != 500 || !strings.Contains(rec.Body.String(), "lmr_internal_error") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if st := e.status(t); !st["A"].Healthy || st["A"].ConsecutiveFailures != 0 || a.hits.Load() != 0 {
+		t.Fatalf("A = %+v hits=%d", st["A"], a.hits.Load())
+	}
+}
+
+func TestHostAndOriginChecksWithoutAuth(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")}, nil)
+	get := func(host, origin string) int {
+		req, _ := http.NewRequest("GET", e.srv.URL+"/v1/models", nil)
+		if host != "" {
+			req.Host = host
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := e.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for _, host := range []string{"localhost", "localhost:4000", "127.0.0.1:4000", "127.9.9.9", "[::1]:4000", "[::1]"} {
+		if c := get(host, ""); c != 200 {
+			t.Errorf("Host %q = %d, want 200", host, c)
+		}
+	}
+	for _, host := range []string{"evil.example", "evil.example:4000", "192.168.1.5:4000", "localhost.evil.example"} {
+		if c := get(host, ""); c != 403 {
+			t.Errorf("Host %q = %d, want 403 (DNS rebinding)", host, c)
+		}
+	}
+	if c := get("", "http://localhost:3000"); c != 200 {
+		t.Errorf("loopback Origin = %d", c)
+	}
+	for _, origin := range []string{"http://evil.example", "null", "https://127.0.0.1.evil.example"} {
+		if c := get("", origin); c != 403 {
+			t.Errorf("Origin %q = %d, want 403 (CSRF)", origin, c)
+		}
+	}
+	// Liveness stays open for any Host.
+	req, _ := http.NewRequest("GET", e.srv.URL+"/healthz", nil)
+	req.Host = "evil.example"
+	if resp, err := e.srv.Client().Do(req); err != nil || resp.StatusCode != 200 {
+		t.Errorf("/healthz with foreign Host: %v %v", resp, err)
+	}
+}
+
+func TestHostAndOriginNotCheckedWithAuth(t *testing.T) {
+	t.Setenv("LMR_T_INBOUND", "k")
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")},
+		map[string]any{"inbound_api_key_env": "LMR_T_INBOUND"})
+	req, _ := http.NewRequest("GET", e.srv.URL+"/v1/models", nil)
+	req.Host = "gateway.lan"
+	req.Header.Set("Origin", "http://app.lan")
+	req.Header.Set("Authorization", "Bearer k")
+	resp, err := e.srv.Client().Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("%v %v", resp, err)
+	}
+	resp.Body.Close()
+}
+
+func TestIdentityHeadersStripped(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "m")}, nil)
+	e.chat(t, "m", "Cookie", "session=1", "Forwarded", "for=1.2.3.4", "X-Forwarded-For", "1.2.3.4",
+		"X-Forwarded-Host", "h", "X-Real-Ip", "1.2.3.4", "X-Keep", "yes")
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.Header["X_Under_Score"] = []string{"1"}
+	if resp, err := e.srv.Client().Do(req); err == nil {
+		resp.Body.Close()
+	}
+	for _, r := range func() []seen { a.mu.Lock(); defer a.mu.Unlock(); return a.reqs }() {
+		for k := range r.header {
+			if k == "Cookie" || k == "Forwarded" || k == "X-Real-Ip" || strings.HasPrefix(k, "X-Forwarded-") || strings.Contains(k, "_") {
+				t.Errorf("header %q reached the backend", k)
+			}
+		}
+	}
+	if a.reqs[0].header.Get("X-Keep") != "yes" {
+		t.Error("ordinary header dropped")
+	}
+}
+
+func TestDescribeErrorIsAlwaysAClass(t *testing.T) {
+	cases := map[string]error{
+		"transport error":    &net.OpError{Op: "dial", Err: errors.New("secret 10.0.0.5:99 gpu.lan")},
+		"connection refused": &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED},
+		"dns error":          &net.DNSError{Name: "gpu.lan", Err: "no such host"},
+		"tls error":          errors.New("tls: failed to verify certificate for gpu.lan"),
+		"timeout":            context.DeadlineExceeded,
+	}
+	for want, err := range cases {
+		wrapped := &url.Error{Op: "Post", URL: "http://gpu.lan:8080/v1/x", Err: err}
+		if got := describeError(wrapped); got != want {
+			t.Errorf("describeError(%v) = %q, want %q", err, got, want)
+		}
+	}
 }

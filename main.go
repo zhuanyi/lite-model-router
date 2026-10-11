@@ -84,6 +84,7 @@ func run() int {
 		log.Error("server failed", "err", err)
 		return 1
 	case <-ctx.Done():
+		stop() // restore default handling: a second signal kills us during the drain
 	}
 
 	log.Info("shutting down", "drain", "10s")

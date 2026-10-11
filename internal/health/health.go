@@ -46,6 +46,7 @@ type Backend struct {
 	lastProxyOK  time.Time // last successful proxied response
 	probing      bool
 	nextProbe    time.Time
+	wake         chan struct{} // 1-slot: state changed, prober should reschedule
 }
 
 // New returns a Backend in the optimistic healthy state.
@@ -65,7 +66,7 @@ func New(name string, o Options) *Backend {
 	t := o.Now()
 	return &Backend{
 		name: name, interval: o.Interval, now: o.Now, jitter: o.Jitter, log: o.Logger,
-		healthy: true, healthySince: t, lastChange: t,
+		healthy: true, healthySince: t, lastChange: t, wake: make(chan struct{}, 1),
 	}
 }
 
@@ -110,13 +111,15 @@ func (b *Backend) ProbeOK() {
 	b.up(b.now())
 }
 
-// ProbeFail records a failed probe, unless a proxied request succeeded within
-// the last interval (a saturated server may fail probes while serving fine).
+// ProbeFail records a failed probe. While healthy it is ignored if a proxied
+// request succeeded within the last interval (a saturated server may fail
+// probes while serving fine). Once unhealthy it always counts, otherwise
+// retryAt would never advance and the prober would spin.
 func (b *Backend) ProbeFail(msg string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	t := b.now()
-	if t.Sub(b.lastProxyOK) < b.interval {
+	if b.healthy && t.Sub(b.lastProxyOK) < b.interval {
 		return
 	}
 	b.down(msg, t)
@@ -129,6 +132,15 @@ func (b *Backend) up(t time.Time) {
 	}
 	b.healthy, b.healthySince, b.lastChange = true, t, t
 	b.log.Info("backend health", "backend", b.name, "healthy", true)
+	b.signal()
+}
+
+// signal tells the prober its timer is stale. Caller holds mu.
+func (b *Backend) signal() {
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
 }
 
 // down records a failure and schedules the next eligibility time.
@@ -152,6 +164,7 @@ func (b *Backend) down(msg string, t time.Time) {
 		b.failures++
 	}
 	b.retryAt = t.Add(time.Duration(float64(b.Backoff(b.failures)) * b.jitter()))
+	b.signal()
 }
 
 // Snapshot is the /status view of a backend. It carries no URLs or secrets.
@@ -186,6 +199,9 @@ func (b *Backend) Run(ctx context.Context, probe func(context.Context) error) {
 		case <-ctx.Done():
 			t.Stop()
 			return
+		case <-b.wake: // state changed under us: recompute the schedule
+			t.Stop()
+			continue
 		case <-t.C:
 		}
 		err := probe(ctx)
