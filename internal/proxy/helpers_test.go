@@ -103,6 +103,9 @@ func bk(url string, kv ...any) map[string]any {
 	for i := 0; i < len(kv); i += 2 {
 		m[kv[i].(string)] = kv[i+1]
 	}
+	if _, ok := m["health"]; !ok {
+		m["health"] = map[string]any{"path": ""} // passive only unless a test opts in
+	}
 	return m
 }
 

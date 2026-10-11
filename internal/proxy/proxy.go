@@ -220,6 +220,7 @@ type reqLog struct {
 	ttfb, dur                                   time.Duration
 	bytes                                       int64
 	err                                         string
+	failed                                      []string // "backend: error" per failed attempt
 }
 
 func (h *Handler) logRequest(l *reqLog) {
@@ -229,6 +230,9 @@ func (h *Handler) logRequest(l *reqLog) {
 	attrs := []any{"method", l.method, "path", l.path, "model", l.model, "backend", l.backend,
 		"upstream_model", l.upstreamModel, "status", l.status, "attempts", l.attempts,
 		"ttfb_ms", l.ttfb.Milliseconds(), "dur_ms", l.dur.Milliseconds(), "bytes", l.bytes}
+	if len(l.failed) > 0 {
+		attrs = append(attrs, "failed_attempts", strings.Join(l.failed, "; "))
+	}
 	if l.err != "" {
 		attrs = append(attrs, "err", l.err)
 	}
@@ -294,8 +298,7 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		last    *savedResponse // last upstream 5xx, returned verbatim if all fail
-		failed  []string
+		last    *savedResponse        // last upstream 5xx, returned verbatim if all fail
 		bodies  = map[string][]byte{} // rewritten body per upstream model
 		ordered = health.Order(chain, func(t target) bool { return t.be.h.Eligible() })
 	)
@@ -326,7 +329,7 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			msg := describeError(err)
 			t.be.h.Failure(msg)
-			failed = append(failed, t.be.name+": "+msg)
+			rl.failed = append(rl.failed, t.be.name+": "+msg)
 			continue
 		}
 		if resp.StatusCode >= 500 {
@@ -335,7 +338,7 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 			if c := resp.StatusCode; c == 502 || c == 503 || c == 504 {
 				t.be.h.Failure(fmt.Sprintf("upstream status %d", c))
 			}
-			failed = append(failed, fmt.Sprintf("%s: status %d", t.be.name, resp.StatusCode))
+			rl.failed = append(rl.failed, fmt.Sprintf("%s: status %d", t.be.name, resp.StatusCode))
 			continue
 		}
 
@@ -352,7 +355,7 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 		last.write(w)
 		return
 	}
-	fail(http.StatusBadGateway, "lmr_upstream_error", "all backends failed: "+strings.Join(failed, "; "))
+	fail(http.StatusBadGateway, "lmr_upstream_error", "all backends failed: "+strings.Join(rl.failed, "; "))
 }
 
 // readBody buffers the request body once so it can be replayed on retry.

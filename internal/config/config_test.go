@@ -185,3 +185,30 @@ func TestListenWarningOnlyForFinalAddress(t *testing.T) {
 		t.Fatalf("err=%v warnings=%v", err, c.Warnings)
 	}
 }
+
+func TestHealthPathDefaulting(t *testing.T) {
+	for _, tc := range []struct {
+		name, health, want string
+	}{
+		{"no health block", ``, DefaultProbePath},
+		{"health block without path", `, "health": {"interval": "5s"}`, DefaultProbePath},
+		{"explicit empty disables", `, "health": {"path": ""}`, ""},
+		{"custom path", `, "health": {"path": "/health"}`, "/health"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := `{"backends": {"b": {"base_url": "http://127.0.0.1:1"` + tc.health + `}},
+			         "models": {"m": [{"backend": "b", "model": "x"}]}}`
+			c, err := Parse([]byte(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.Backends["b"].Health.ProbePath; got != tc.want {
+				t.Fatalf("probe path = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, err := Parse([]byte(`{"backends": {"b": {"base_url": "http://127.0.0.1:1", "health": {"path": "v1/models"}}},
+	    "models": {"m": [{"backend": "b", "model": "x"}]}}`)); err == nil || !strings.Contains(err.Error(), "must start with /") {
+		t.Fatalf("relative path accepted: %v", err)
+	}
+}

@@ -148,6 +148,15 @@ func TestAllFailNoResponse502(t *testing.T) {
 			t.Fatalf("502 body leaks backend address: %s", body)
 		}
 	}
+	// The request log lists every failed attempt, matching the error body.
+	want := "A: connection refused; B: connection refused"
+	if !strings.Contains(doc.Error.Message, want) {
+		t.Errorf("error body = %q", doc.Error.Message)
+	}
+	waitFor(t, "request log", func() bool { return strings.Contains(e.logs.String(), "msg=req") })
+	if logs := e.logs.String(); !strings.Contains(logs, `failed_attempts="`+want+`"`) {
+		t.Errorf("request log does not list each failed attempt:\n%s", logs)
+	}
 	if !strings.Contains(doc.Error.Message, "A: connection refused") {
 		t.Fatalf("message = %q", doc.Error.Message)
 	}
@@ -985,5 +994,38 @@ func TestSlowSteadyStreamNotCutByIdleTimeout(t *testing.T) {
 	}
 	if st := e.status(t); !st["A"].Healthy {
 		t.Fatalf("A status = %+v", st["A"])
+	}
+}
+
+func TestDefaultProbePathDetectsDeadBackend(t *testing.T) {
+	// No health.path: the default /v1/models probe must run and demote it.
+	e := newEnv(t, map[string]any{"A": map[string]any{"base_url": deadURL(t),
+		"health": map[string]any{"interval": "50ms", "timeout": "50ms"}}},
+		map[string]any{"m": chain("A", "x")}, nil)
+	waitFor(t, "A demoted by probe", func() bool {
+		st := e.status(t)["A"]
+		return !st.Healthy && st.LastError == "connection refused" && st.NextProbeIn != ""
+	})
+}
+
+func TestDefaultProbePathIsV1Models(t *testing.T) {
+	var probes atomic.Int32
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			probes.Add(1)
+		}
+	})
+	newEnv(t, map[string]any{"A": map[string]any{"base_url": a.URL,
+		"health": map[string]any{"interval": "50ms"}}},
+		map[string]any{"m": chain("A", "x")}, nil)
+	waitFor(t, "default probe", func() bool { return probes.Load() > 0 })
+}
+
+func TestNextProbeInOmittedForPassiveBackend(t *testing.T) {
+	a := newFake(t, "A", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL)}, map[string]any{"m": chain("A", "x")}, nil)
+	_, body := e.do(t, "GET", "/status", "")
+	if strings.Contains(string(body), "next_probe_in") {
+		t.Fatalf("passive-only backend reports next_probe_in: %s", body)
 	}
 }

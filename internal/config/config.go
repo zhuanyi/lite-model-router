@@ -25,6 +25,7 @@ const (
 	DefaultListen           = "127.0.0.1:4000"
 	DefaultMaxBodyBytes     = 64 << 20
 	DefaultMaxConcurrent    = 64
+	DefaultProbePath        = "/v1/models"
 	DefaultProbeInterval    = 10 * time.Second
 	DefaultProbeTimeout     = 2 * time.Second
 	DefaultConnectTimeout   = 3 * time.Second
@@ -88,10 +89,13 @@ type Backend struct {
 
 // Health configures active probing of a backend.
 type Health struct {
-	Path     string `json:"path"`
-	Interval string `json:"interval"`
-	Timeout  string `json:"timeout"`
+	// Path is a pointer so an unset path (use DefaultProbePath) can be told
+	// apart from an explicit "" (active probing disabled).
+	Path     *string `json:"path"`
+	Interval string  `json:"interval"`
+	Timeout  string  `json:"timeout"`
 
+	ProbePath   string        `json:"-"` // resolved path; "" = passive only
 	IntervalDur time.Duration `json:"-"`
 	TimeoutDur  time.Duration `json:"-"`
 }
@@ -264,7 +268,11 @@ func (c *Config) validateBackend(name string, b *Backend, bad func(string, ...an
 			"backend %q sends its API key over plain http to a non-loopback host", name))
 	}
 
-	if p := b.Health.Path; p != "" && !strings.HasPrefix(p, "/") {
+	b.Health.ProbePath = DefaultProbePath
+	if b.Health.Path != nil {
+		b.Health.ProbePath = *b.Health.Path
+	}
+	if p := b.Health.ProbePath; p != "" && !strings.HasPrefix(p, "/") {
 		bad("%s.health.path: must start with /", where)
 	}
 	b.Health.IntervalDur = parseDur(where+".health.interval", b.Health.Interval, DefaultProbeInterval, bad)

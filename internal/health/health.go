@@ -173,7 +173,7 @@ type Snapshot struct {
 	LastError           string    `json:"last_error"`
 	LastChange          time.Time `json:"last_change"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
-	NextProbeIn         string    `json:"next_probe_in"` // "" when passive-only
+	NextProbeIn         string    `json:"next_probe_in,omitempty"` // omitted when passive-only
 }
 
 // Snapshot returns the current state.
