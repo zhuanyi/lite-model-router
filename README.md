@@ -70,6 +70,7 @@ Flags: `-config path` (default `config.json`), `-listen addr` (overrides config)
 | `backends.*.health.interval` / `timeout` | `10s` / `2s` | Probe cadence; unhealthy backends back off exponentially up to 5m. |
 | `backends.*.connect_timeout` | `3s` | Dial + TLS timeout. |
 | `backends.*.first_byte_timeout` | `300s` | Max wait for response headers (long prompts on local models can be slow). |
+| `backends.*.stream_idle_timeout` | `300s` | Max gap between response chunks once streaming started; a stalled backend's stream is aborted (client sees a truncated response) and the backend is marked unhealthy. `"0"` disables. |
 | `backends.*.expose_models` | – | Real model names clients can request directly on this backend. |
 | `models.<name>` | – | Virtual model: ordered list of `{backend, model}`; `model` is the name sent upstream. |
 
