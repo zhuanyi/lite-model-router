@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/hero.png" alt="lite-model-router" width="720">
+<img src="docs/assets/hero.svg" alt="lite-model-router: one model name, an ordered, health-checked fallback chain of real backends" width="720">
 
 # lite-model-router
 
@@ -43,9 +43,9 @@ Clients usually hard-code one base URL and one model. When that backend is a lap
 flowchart LR
     C["Client<br/>model: vision"] --> P["lite-model-router"]
     P --> V{"virtual model<br/>vision"}
-    V --> B1["1. gpu-laptop<br/>qwen2.5-vl-32b"]
-    V -.->|"if unhealthy or failed"| B2["2. mini-pc<br/>qwen2.5vl:7b"]
-    V -.->|"if unhealthy or failed"| B3["3. openai<br/>gpt-4o-mini"]
+    V --> B1["1st: gpu-laptop<br/>qwen2.5-vl-32b"]
+    V -.->|"if unhealthy or failed"| B2["2nd: mini-pc<br/>qwen2.5vl:7b"]
+    V -.->|"if unhealthy or failed"| B3["3rd: openai<br/>gpt-4o-mini"]
     H(["health prober<br/>GET health.path"]) -. "up / down" .-> B1
     H -.-> B2
     H -.-> B3
@@ -56,7 +56,7 @@ Each backend moves through these states:
 ```mermaid
 stateDiagram-v2
     [*] --> Healthy
-    Healthy --> Unhealthy: probe fails or request fails
+    Healthy --> Unhealthy: probe fails, or request hits connect error, timeout, 502/503/504
     Unhealthy --> Unhealthy: retry fails, backoff doubles (max 5m)
     Unhealthy --> Healthy: probe or request succeeds
     note right of Unhealthy
@@ -70,12 +70,14 @@ And each request:
 ```mermaid
 flowchart TD
     R["request"] --> M["resolve model<br/>(JSON body, multipart field, or X-Model)"]
-    M --> N["next backend in chain"]
-    N --> E{"eligible?<br/>healthy, or retry time passed"}
-    E -- no --> N
-    E -- yes --> U["send upstream"]
+    M --> O{"any backend in chain<br/>eligible? (healthy, or<br/>retry time passed)"}
+    O -- yes --> N["next eligible backend<br/>in chain order"]
+    O -- "no: try all, in chain order" --> N
+    N --> U["send upstream"]
     U --> F{"failed before<br/>any response byte?"}
-    F -- "yes: refused, first-byte timeout, 5xx" --> N
+    F -- "yes: refused, first-byte timeout, 5xx" --> X{"backends left?"}
+    X -- yes --> N
+    X -- no --> G["502, or the last<br/>upstream 5xx as-is"]
     F -- no --> S["stream response to client<br/>(no retry from here)"]
 ```
 
@@ -205,9 +207,9 @@ go test -run x -bench . -benchmem ./internal/proxy   # proxy overhead benchmark
 
 - `GET /healthz` — `ok` if the proxy is running.
 - `GET /status` — per-backend health, consecutive failures, last error (no URLs or secrets), `next_probe_in` (time until the next active probe; omitted for passive-only backends), plus the virtual model chains.
+- `GET /v1/models` — virtual + exposed models in OpenAI list format.
 
 Requests that had failed attempts (fallbacks, or an all-backends-failed 502) log them in a `failed_attempts="A: connection refused; B: status 503"` field.
-- `GET /v1/models` — virtual + exposed models in OpenAI list format.
 
 ## 📄 License
 
