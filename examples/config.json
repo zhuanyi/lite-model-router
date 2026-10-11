@@ -7,6 +7,7 @@
       "base_url": "http://gpu-laptop.local:8080",
       "health": {"path": "/v1/models", "interval": "10s", "timeout": "2s"},
       "first_byte_timeout": "120s",
+      "stream_idle_timeout": "120s",
       "expose_models": ["qwen2.5-vl-32b"]
     },
     "mini-pc": {

@@ -29,6 +29,7 @@ const (
 	DefaultProbeTimeout     = 2 * time.Second
 	DefaultConnectTimeout   = 3 * time.Second
 	DefaultFirstByteTimeout = 300 * time.Second
+	DefaultStreamIdle       = 300 * time.Second
 )
 
 const listenWarnPrefix = "listening on"
@@ -66,17 +67,21 @@ type Target struct {
 
 // Backend describes one upstream server.
 type Backend struct {
-	BaseURL          string   `json:"base_url"`
-	APIKeyEnv        string   `json:"api_key_env"`
-	AuthStyle        string   `json:"auth_style"`
-	Health           Health   `json:"health"`
-	ConnectTimeout   string   `json:"connect_timeout"`
-	FirstByteTimeout string   `json:"first_byte_timeout"`
-	ExposeModels     []string `json:"expose_models"`
+	BaseURL           string   `json:"base_url"`
+	APIKeyEnv         string   `json:"api_key_env"`
+	AuthStyle         string   `json:"auth_style"`
+	Health            Health   `json:"health"`
+	ConnectTimeout    string   `json:"connect_timeout"`
+	FirstByteTimeout  string   `json:"first_byte_timeout"`
+	StreamIdleTimeout string   `json:"stream_idle_timeout"`
+	ExposeModels      []string `json:"expose_models"`
 
 	// Parsed durations (defaults applied).
 	Connect   time.Duration `json:"-"`
 	FirstByte time.Duration `json:"-"`
+	// StreamIdle is the longest gap allowed between response body reads once
+	// a response is committed; 0 disables the check.
+	StreamIdle time.Duration `json:"-"`
 
 	apiKey string // resolved from APIKeyEnv
 }
@@ -266,6 +271,9 @@ func (c *Config) validateBackend(name string, b *Backend, bad func(string, ...an
 	b.Health.TimeoutDur = parseDur(where+".health.timeout", b.Health.Timeout, DefaultProbeTimeout, bad)
 	b.Connect = parseDur(where+".connect_timeout", b.ConnectTimeout, DefaultConnectTimeout, bad)
 	b.FirstByte = parseDur(where+".first_byte_timeout", b.FirstByteTimeout, DefaultFirstByteTimeout, bad)
+	if b.StreamIdleTimeout != "0" { // "0" disables
+		b.StreamIdle = parseDur(where+".stream_idle_timeout", b.StreamIdleTimeout, DefaultStreamIdle, bad)
+	}
 }
 
 // parseDur parses a time.ParseDuration string; "" yields def.
