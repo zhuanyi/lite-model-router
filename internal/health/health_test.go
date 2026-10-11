@@ -83,7 +83,7 @@ func TestFlappingKeepsGrowingStableDecays(t *testing.T) {
 	b.ProbeOK() // up, healthySince=now
 	c.Advance(5 * time.Second)
 	b.Failure("x") // up for 5s < 2*interval: keeps growing
-	if f := b.Snapshot().ConsecutiveFailures; f != 2 {
+	if f := level(b); f != 2 {
 		t.Fatalf("flapping: failures=%d, want 2", f)
 	}
 	if got := retryIn(b, c); got != 20*time.Second {
@@ -94,7 +94,7 @@ func TestFlappingKeepsGrowingStableDecays(t *testing.T) {
 	b.ProbeOK()
 	c.Advance(20 * time.Second) // stable for 2 intervals
 	b.Failure("x")
-	if f := b.Snapshot().ConsecutiveFailures; f != 1 {
+	if f := level(b); f != 1 {
 		t.Fatalf("stable: failures=%d, want restart at 1", f)
 	}
 	if got := retryIn(b, c); got != 10*time.Second {
@@ -106,7 +106,7 @@ func TestSuccessDoesNotResetFailures(t *testing.T) {
 	b, _ := newTest(10 * time.Second)
 	b.Failure("x")
 	b.Success()
-	if f := b.Snapshot().ConsecutiveFailures; f != 1 {
+	if f := level(b); f != 1 {
 		t.Fatalf("failures reset by single success: %d", f)
 	}
 }
@@ -117,7 +117,7 @@ func TestLastResortFailuresDontEscalate(t *testing.T) {
 	for range 20 { // many requests hammering the last-resort backend
 		b.Failure("x")
 	}
-	if f := b.Snapshot().ConsecutiveFailures; f != 1 {
+	if f := level(b); f != 1 {
 		t.Fatalf("failures = %d, want 1", f)
 	}
 	if got := retryIn(b, c); got != 10*time.Second {
@@ -252,4 +252,29 @@ func TestRunWakesOnPassiveStateChange(t *testing.T) {
 	b.mu.Unlock()
 	b.Failure("boom")
 	waitFor(t, func() bool { return calls.Load() > 0 && b.Snapshot().Healthy })
+}
+
+// level reads the internal backoff level, which survives recovery (anti-flap)
+// unlike the consecutive_failures shown in /status.
+func level(b *Backend) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failures
+}
+
+func TestRecoveryClearsStatusErrorFields(t *testing.T) {
+	b, c := newTest(10 * time.Second)
+	b.Failure("connection refused")
+	c.Advance(10 * time.Second)
+	b.Failure("connection refused")
+	if s := b.Snapshot(); s.Healthy || s.LastError != "connection refused" || s.ConsecutiveFailures != 2 {
+		t.Fatalf("while down: %+v", s)
+	}
+	b.ProbeOK()
+	if s := b.Snapshot(); !s.Healthy || s.LastError != "" || s.ConsecutiveFailures != 0 {
+		t.Fatalf("after recovery: %+v", s)
+	}
+	if level(b) != 2 {
+		t.Fatalf("backoff level must survive recovery (anti-flap): %d", level(b))
+	}
 }

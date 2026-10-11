@@ -100,9 +100,24 @@ func New(cfg *config.Config, logger *slog.Logger) (*Handler, error) {
 	return h, nil
 }
 
-// Start launches one prober per backend that has a health path. Probers stop
-// when ctx is cancelled.
+// Start probes every actively checked backend once, concurrently, and waits
+// for the results (each bounded by its health.timeout), so the first request
+// is not routed to a backend that is already down. It then launches one
+// prober loop per such backend; probers stop when ctx is cancelled.
+// Passive-only backends start optimistic (healthy).
 func (h *Handler) Start(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, be := range h.backends {
+		if be.probePath == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			be.h.ProbeResult(be.probe(ctx))
+		}()
+	}
+	wg.Wait()
 	for _, be := range h.backends {
 		if be.probePath != "" {
 			go be.h.Run(ctx, be.probe)
@@ -124,14 +139,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
+	// reject writes an error and logs the request line (never headers or keys).
+	reject := func(status int, typ, msg, why string) {
+		writeError(w, status, typ, msg)
+		h.logRequest(&reqLog{method: r.Method, path: path, status: status, err: why})
+	}
 	if !h.authOn && !h.allowRem && !localRequest(r) {
 		// No inbound auth: refuse browsers (CSRF) and DNS-rebinding hosts.
-		writeError(w, http.StatusForbidden, "forbidden", "requests must target a loopback host when inbound auth is off")
+		reject(http.StatusForbidden, "forbidden", "requests must target a loopback host when inbound auth is off",
+			"non-loopback host or origin")
 		return
 	}
 	if !h.authorized(r) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
+		reject(http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "inbound auth failed")
 		return
 	}
 	switch {
@@ -142,7 +163,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/v1/"):
 		h.serveProxy(w, r)
 	default:
-		writeError(w, http.StatusNotFound, "not_found", "not found")
+		reject(http.StatusNotFound, "not_found", "not found", "unknown path")
 	}
 }
 
@@ -334,7 +355,10 @@ func (h *Handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode >= 500 {
 			last = saveResponse(resp)
-			// Only gateway-class errors demote; a plain 500 may be our request's fault.
+			// Only gateway-class errors (502/503/504) demote. A plain 500 may be
+			// this request's fault, and 501 means this backend lacks the
+			// endpoint (e.g. no /v1/embeddings) while still serving others
+			// fine: both fall back to the next backend without demoting.
 			if c := resp.StatusCode; c == 502 || c == 503 || c == 504 {
 				t.be.h.Failure(fmt.Sprintf("upstream status %d", c))
 			}
