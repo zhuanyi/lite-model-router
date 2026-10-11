@@ -17,7 +17,7 @@ const validJSON = `{
     "gpu": {"base_url": "http://127.0.0.1:8080", "expose_models": ["qwen-direct"],
             "health": {"path": "/v1/models", "interval": "5s", "timeout": "1s"}},
     "cloud": {"base_url": "https://api.example.com", "api_key_env": "LMR_TEST_CLOUD",
-              "first_byte_timeout": "30s"}
+              "first_byte_timeout": "30s", "stream_idle_timeout": "0"}
   },
   "models": {"vision": [{"backend": "gpu", "model": "qwen-vl"}, {"backend": "cloud", "model": "gpt"}]}
 }`
@@ -47,6 +47,9 @@ func TestValid(t *testing.T) {
 	}
 	if gpu.Connect != DefaultConnectTimeout || gpu.FirstByte != DefaultFirstByteTimeout {
 		t.Errorf("defaults not applied: %v %v", gpu.Connect, gpu.FirstByte)
+	}
+	if gpu.StreamIdle != DefaultStreamIdle || cloud.StreamIdle != 0 {
+		t.Errorf("stream idle: gpu %v, cloud %v (want default, disabled)", gpu.StreamIdle, cloud.StreamIdle)
 	}
 	if cloud.FirstByte != 30*time.Second || cloud.AuthStyle != AuthBearer {
 		t.Errorf("cloud: %+v", cloud)

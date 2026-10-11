@@ -928,3 +928,62 @@ func TestDescribeErrorIsAlwaysAClass(t *testing.T) {
 		}
 	}
 }
+
+func TestStalledStreamAbortedByIdleTimeout(t *testing.T) {
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: one\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // stall after the first event
+	})
+	b := newFake(t, "B", nil)
+	e := newEnv(t, map[string]any{"A": bk(a.URL, "stream_idle_timeout", "150ms"), "B": bk(b.URL)},
+		map[string]any{"m": chain("A", "m", "B", "m")}, nil)
+
+	start := time.Now()
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	resp, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("client saw a clean EOF for a stalled stream (%q)", data)
+	}
+	if string(data) != "data: one\n\n" {
+		t.Fatalf("data = %q", data)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("stall detected after %v", d)
+	}
+	if b.hits.Load() != 0 {
+		t.Fatalf("second backend got %d requests after the stream started", b.hits.Load())
+	}
+	waitFor(t, "idle log", func() bool { return strings.Contains(e.logs.String(), "stream idle timeout") })
+	if st := e.status(t); st["A"].Healthy || st["A"].LastError != "stream idle timeout" {
+		t.Fatalf("A status = %+v", st["A"])
+	}
+}
+
+func TestSlowSteadyStreamNotCutByIdleTimeout(t *testing.T) {
+	a := newFake(t, "A", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		for i := 0; i < 6; i++ { // 6×50ms = 300ms total, well over the 150ms idle limit
+			_, _ = io.WriteString(w, "data: x\n\n")
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	e := newEnv(t, map[string]any{"A": bk(a.URL, "stream_idle_timeout", "150ms")},
+		map[string]any{"m": chain("A", "m")}, nil)
+	resp, body := e.chat(t, "m")
+	if resp.StatusCode != 200 || strings.Count(string(body), "data: x") != 6 {
+		t.Fatalf("status %d body %q", resp.StatusCode, body)
+	}
+	if st := e.status(t); !st["A"].Healthy {
+		t.Fatalf("A status = %+v", st["A"])
+	}
+}
