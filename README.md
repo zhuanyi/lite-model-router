@@ -66,7 +66,7 @@ Flags: `-config path` (default `config.json`), `-listen addr` (overrides config)
 | `backends.*.base_url` | – | Scheme + host [+ path prefix]; the client's `/v1/...` path is appended. |
 | `backends.*.api_key_env` | – | Env var with the upstream key. Keys are never stored in the config, logged, or shown in `/status`. |
 | `backends.*.auth_style` | `bearer` | `bearer` (`Authorization: Bearer`), `anthropic` (`x-api-key`, `anthropic-version` defaulted to `2023-06-01`), `none`. Client credentials are always stripped. |
-| `backends.*.health.path` | `/v1/models` | Active probe (GET, 2xx = up). `""` disables probing (passive only). |
+| `backends.*.health.path` | `/v1/models` | Active probe (GET, 2xx = up). Applies when `path` is omitted; an explicit `""` disables probing (passive only). |
 | `backends.*.health.interval` / `timeout` | `10s` / `2s` | Probe cadence; unhealthy backends back off exponentially up to 5m. |
 | `backends.*.connect_timeout` | `3s` | Dial + TLS timeout. |
 | `backends.*.first_byte_timeout` | `300s` | Max wait for response headers (long prompts on local models can be slow). |
@@ -111,7 +111,9 @@ go test -run x -bench . -benchmem ./internal/proxy   # proxy overhead benchmark
 ## Status endpoints
 
 - `GET /healthz` — `ok` if the proxy is running.
-- `GET /status` — per-backend health, consecutive failures, last error (no URLs or secrets), plus the virtual model chains.
+- `GET /status` — per-backend health, consecutive failures, last error (no URLs or secrets), `next_probe_in` (time until the next active probe; omitted for passive-only backends), plus the virtual model chains.
+
+Requests that had failed attempts (fallbacks, or an all-backends-failed 502) log them in a `failed_attempts="A: connection refused; B: status 503"` field.
 - `GET /v1/models` — virtual + exposed models in OpenAI list format.
 
 ## License

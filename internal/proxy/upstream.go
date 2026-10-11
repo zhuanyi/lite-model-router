@@ -50,7 +50,7 @@ func newBackend(name string, bc *config.Backend, useEnvProxy bool, h *health.Bac
 	return &backend{
 		name: name, base: strings.TrimRight(bc.BaseURL, "/"),
 		auth: bc.AuthStyle, key: bc.APIKey(),
-		probePath: bc.Health.Path, probeTimeout: bc.Health.TimeoutDur,
+		probePath: bc.Health.ProbePath, probeTimeout: bc.Health.TimeoutDur,
 		streamIdle: bc.StreamIdle,
 		transport:  tr, h: h,
 		client: &http.Client{

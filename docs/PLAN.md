@@ -41,7 +41,7 @@ Packages (all in one module `github.com/zhuanyi/lite-model-router`):
 | Path | Behaviour |
 |---|---|
 | `GET /healthz` | `200 ok` (liveness of the proxy itself; no auth). |
-| `GET /status` | JSON: per-backend `{healthy, last_error, last_change, consecutive_failures, next_probe_in}` and virtual model chains. No secrets, no URLs userinfo. Requires inbound auth if enabled. |
+| `GET /status` | JSON: per-backend `{healthy, last_error, last_change, consecutive_failures, next_probe_in}` (`next_probe_in` omitted for passive-only backends) and virtual model chains. No secrets, no URLs userinfo. Requires inbound auth if enabled. |
 | `GET /v1/models` | OpenAI list of virtual models + exposed backend models; generated locally. |
 | `* /v1/*` (anything else, incl. `/v1/messages`) | Proxied. |
 | other | 404. |
@@ -164,7 +164,9 @@ When inbound auth is **off**, requests (except `/healthz`) must carry a loopback
 ## 9. Logging
 
 One line per proxied request, `log/slog` text handler to stderr:
-`level=INFO msg=req method=POST path=/v1/chat/completions model=vision backend=mini-pc upstream_model=qwen2.5-vl-7b status=200 attempts=2 ttfb_ms=812 dur_ms=10233 bytes=48123`
+`level=INFO msg=req method=POST path=/v1/chat/completions model=vision backend=mini-pc upstream_model=qwen2.5-vl-7b status=200 attempts=2 ttfb_ms=812 dur_ms=10233 bytes=48123 failed_attempts="gpu-laptop: connection refused"`
+
+`failed_attempts` (present only when an attempt failed) lists every failed attempt as `backend: error class`, matching the 502 error body.
 Never logs headers, bodies or keys. Health transitions are logged (`backend=gpu-laptop healthy=false err="dial tcp: connection refused"`). `-quiet` / `"log_requests": false` disables per-request lines.
 
 ## 10. Success criteria (verifiable)
